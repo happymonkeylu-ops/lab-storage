@@ -7,10 +7,13 @@ const demoData = [
 
 const $ = (id) => document.getElementById(id);
 const form = $('itemForm');
-let items = loadItems();
+const cloudConfig = window.SUPABASE_CONFIG || {};
+const cloudEnabled = Boolean(cloudConfig.url && cloudConfig.anonKey && window.supabase);
+const cloudClient = cloudEnabled ? window.supabase.createClient(cloudConfig.url, cloudConfig.anonKey) : null;
+let items = [];
 let lastQuery = { text: '', room: 'all', expiry: 'all' };
 
-function loadItems() {
+function loadLocalItems() {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) return JSON.parse(stored);
@@ -18,7 +21,38 @@ function loadItems() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(demoData));
   return [...demoData];
 }
-function saveItems() { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); }
+function saveLocalItems() { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); }
+async function loadItems() {
+  if (!cloudEnabled) return loadLocalItems();
+  const { data, error } = await cloudClient.from('inventory_items').select('*').order('created_at', { ascending: false });
+  if (error) throw error;
+  if (!data.length) {
+    const localData = localStorage.getItem(STORAGE_KEY);
+    if (localData) {
+      const localItems = JSON.parse(localData);
+      if (localItems.length) {
+        for (const item of localItems) await saveItem(item);
+        return localItems;
+      }
+    }
+  }
+  return data.map((item) => ({ id: item.id, itemName: item.item_name, room: item.room || '', refrigerator: item.refrigerator || '', temperature: item.temperature || '', shelf: item.shelf || '', storageDate: item.storage_date || '', expiryDate: item.expiry_date || '', productCode: item.product_code || '', price: item.price === null ? '' : String(item.price), currency: item.currency || 'CNY', capacity: item.capacity || '', notes: item.notes || '' }));
+}
+function showDataError(error) {
+  console.error('Inventory data operation failed', error);
+  window.alert(cloudEnabled ? '云端数据操作失败，请检查 Supabase 配置和数据库权限。' : '本地数据操作失败，请检查浏览器存储权限。');
+}
+async function saveItem(item) {
+  if (!cloudEnabled) { saveLocalItems(); return; }
+  const record = { id: item.id, item_name: item.itemName, room: item.room || null, refrigerator: item.refrigerator || null, temperature: item.temperature || null, shelf: item.shelf || null, storage_date: item.storageDate || null, expiry_date: item.expiryDate || null, product_code: item.productCode || null, price: item.price === '' ? null : Number(item.price), currency: item.currency || 'CNY', capacity: item.capacity || null, notes: item.notes || null, updated_at: new Date().toISOString() };
+  const { error } = await cloudClient.from('inventory_items').upsert(record);
+  if (error) throw error;
+}
+async function deleteItem(id) {
+  if (!cloudEnabled) { saveLocalItems(); return; }
+  const { error } = await cloudClient.from('inventory_items').delete().eq('id', id);
+  if (error) throw error;
+}
 function getValue(id) { return $(id).value.trim(); }
 function display(text) { return text || '<span class="muted-value">\u672a\u586b\u5199</span>'; }
 function formatDate(dateString) {
@@ -80,12 +114,13 @@ function openForm(item) {
 function closeForm() { $('formPanel').hidden = true; resetForm(); }
 function readQuery() { return { text: $('searchInput').value.trim().toLowerCase(), room: $('roomFilter').value, expiry: $('expiryFilter').value }; }
 
-form.addEventListener('submit', (event) => {
+form.addEventListener('submit', async (event) => {
   event.preventDefault();
   const entry = { id: $('itemId').value ? Number($('itemId').value) : Date.now(), itemName: getValue('itemName'), room: getValue('room'), refrigerator: getValue('refrigerator'), temperature: getValue('temperature'), shelf: getValue('shelf'), storageDate: getValue('storageDate'), expiryDate: getValue('expiryDate'), productCode: getValue('productCode'), price: getValue('price'), currency: getValue('currency') || 'CNY', capacity: getValue('capacity'), notes: getValue('notes') };
   const index = items.findIndex((item) => item.id === entry.id);
+  const previousItem = index === -1 ? null : items[index];
   if (index === -1) items.unshift(entry); else items[index] = entry;
-  saveItems(); renderAll(); closeForm();
+  try { await saveItem(entry); renderAll(); closeForm(); } catch (error) { if (index === -1) items.shift(); else items[index] = previousItem; renderAll(); showDataError(error); }
 });
 $('findBtn').addEventListener('click', () => renderTable(readQuery()));
 $('clearFiltersBtn').addEventListener('click', () => { $('searchInput').value = ''; $('roomFilter').value = 'all'; $('expiryFilter').value = 'all'; renderTable({ text: '', room: 'all', expiry: 'all' }); });
@@ -94,10 +129,10 @@ $('cancelEditBtn').addEventListener('click', closeForm);
 $('resetFormBtn').addEventListener('click', resetForm);
 $('formPanel').addEventListener('click', (event) => { if (event.target === $('formPanel')) closeForm(); });
 document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('formPanel').hidden) closeForm(); });
-$('itemTableBody').addEventListener('click', (event) => {
+$('itemTableBody').addEventListener('click', async (event) => {
   const button = event.target.closest('button'); if (!button) return;
   const item = items.find((entry) => entry.id === Number(button.dataset.id)); if (!item) return;
   if (button.dataset.action === 'edit') openForm(item);
-  if (button.dataset.action === 'delete' && window.confirm(`\u786e\u5b9a\u5220\u9664\u201c${item.itemName || '\u672a\u547d\u540d\u7269\u54c1'}\u201d\u5417\uff1f`)) { items = items.filter((entry) => entry.id !== item.id); saveItems(); renderAll(); }
+  if (button.dataset.action === 'delete' && window.confirm(`\u786e\u5b9a\u5220\u9664\u201c${item.itemName || '\u672a\u547d\u540d\u7269\u54c1'}\u201d\u5417\uff1f`)) { const previousItems = items; items = items.filter((entry) => entry.id !== item.id); try { await deleteItem(item.id); renderAll(); } catch (error) { items = previousItems; renderAll(); showDataError(error); } }
 });
-renderAll();
+loadItems().then((loadedItems) => { items = loadedItems; renderAll(); }).catch((error) => { items = loadLocalItems(); renderAll(); showDataError(error); });
